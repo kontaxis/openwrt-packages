@@ -2,104 +2,174 @@
 # Copyright (C) 2009 OpenWrt.org
 
 NAME='etherwake'
-START=60
+START=99
 PROGRAM='/usr/bin/etherwake'
 
-start()
-{
-	local value=''
+boot() {
+	etherwake_boot &
+}
+
+etherwake_boot() {
+	etherwake_load_config_setup
+
+	local iface="${ETHERWAKE_CONFIG_SETUP_IFACE}"
+	local timeout="${ETHERWAKE_CONFIG_SETUP_TIMEOUT}"
+
+	if [ "${timeout}" != "0" ] &&
+		! etherwake_wait_for_iface "${iface}" "${timeout}"; then
+		logger -t "${NAME}" \
+			"Interface '${iface}' did not come up within ${timeout} seconds"
+		return 1
+	fi
+
+	start
+}
+
+ETHERWAKE_CONFIG_LOADED='0'
+ETHERWAKE_CONFIG_SETUP_IFACE=''
+ETHERWAKE_CONFIG_SETUP_TIMEOUT=1
+ETHERWAKE_CONFIG_SETUP_BROADCAST='0'
+
+etherwake_load_config_setup() {
+	[ "${ETHERWAKE_CONFIG_LOADED}" != "0" ] && return
 
 	config_load "${NAME}"
 
-	# interface
-	config_get value 'setup' 'interface' 'eth0'
-	append PROGRAM "-i ${value}"
+	config_get ETHERWAKE_CONFIG_SETUP_IFACE 'setup' 'interface' 'eth0'
 
-	# broadcast
-	config_get_bool value 'setup' 'broadcast' '0'
-	[ "${value}" -ne 0 ] && append PROGRAM '-b'
+	config_get ETHERWAKE_CONFIG_SETUP_TIMEOUT 'setup' 'interface_timeout'
+	case "${ETHERWAKE_CONFIG_SETUP_TIMEOUT}" in
+		''|*[!0-9]*)
+			ETHERWAKE_CONFIG_SETUP_TIMEOUT=10
+			;;
+	esac
 
-	# wake up targets
-	config_foreach etherwake_start target $*
+	config_get_bool ETHERWAKE_CONFIG_SETUP_BROADCAST 'setup' 'broadcast' '0'
+
+	ETHERWAKE_CONFIG_LOADED=1
 }
 
-etherwake_start()
-{
-	local section="$1"
-	shift
+# etherwake_wait_for_iface <interface> [<timeout>]
+#
+# wait up to 'timeout' seconds for interface 'iface' to come up.
+# - when 'timeout' is set to 0 the function returns immediately
+#   without checking the status of the interface
+# - default 'timeout' is 1
+etherwake_wait_for_iface() {
+	local iface="$1"
+	local timeout="${2:-1}"
 
-	local names="$*"
+	[ -n "${iface}" ] || return 1
+
+	local interval=1
+	local elapsed=0
+
+	while [ "${elapsed}" -lt "${timeout}" ]; do
+		if [ "$(ubus call network.interface."${iface}" status 2> /dev/null |
+			jsonfilter -e '@.up' 2> /dev/null)" = "true" ]; then
+			logger -t "${NAME}" \
+				"Interface '${iface}' is up after ${elapsed} seconds"
+			return 0
+		fi
+
+		sleep "${interval}"
+		elapsed=$((elapsed + interval))
+	done
+
+	return 1
+}
+
+ETHERWAKE_LAST_ERROR=0
+
+start() {
+	etherwake_load_config_setup
+
+	ETHERWAKE_LAST_ERROR=0
+
+	config_foreach etherwake_start target \
+		"${ETHERWAKE_CONFIG_SETUP_IFACE}" \
+		"${ETHERWAKE_CONFIG_SETUP_BROADCAST}" "$@"
+
+	return ${ETHERWAKE_LAST_ERROR}
+}
+
+# etherwake_start <section> <interface> <broadcast> [<names...>]
+etherwake_start() {
+	local section="$1"; shift
+	local iface="$1"; shift
+	local broadcast="$1"; shift
+	local names="$@"
 
 	local value=''
-	local target=''
+	local filter=''
 
-	if [ -z "${names}" ]
-	 then
-		# check if boot target
+	# are we focusing on all targets that should wake up when this script runs
+	# or specific names?
+	if [ -z "${names}" ]; then
 		config_get_bool value "${section}" 'wakeonboot' '0'
 		[ "${value}" -eq 0 ] && return 0
 
-		# wake up target
-		do_etherwake "${section}"
-		return $?
-	else
-		# name
-		config_get value "${section}" 'name'
-		[ -z "${value}" ] && return 0
-
-		for target in ${names}
-		 do
-			[ "${value}" != "${target}" ] && continue
-
-			# wake up target
-			do_etherwake "${section}"
-			return $?
-		done
+		do_etherwake "${section}" "${iface}" "${broadcast}" || ETHERWAKE_LAST_ERROR=$?
+		return 0
 	fi
+
+	config_get value "${section}" 'name'
+	[ -z "${value}" ] && return 0
+
+	for filter in ${names}; do
+		[ "${value}" != "${filter}" ] && continue
+
+		do_etherwake "${section}" "${iface}" "${broadcast}" || ETHERWAKE_LAST_ERROR=$?
+		break
+	done
+
+	return 0
 }
 
 # execute etherwake command for target
-do_etherwake()
-{
+do_etherwake() {
 	local section="$1"
-	local value=''
-	local password=''
-	local args=''
-	local section_name=''
+	local iface="$2"
+	local broadcast="$3"
 
-	# password (legacy option)
-	config_get value "${section}" 'password'
-	[ -n "${value}" ] && {
-		password=$(etherwake_password "${value}")
-		append args "-p ${password}"
+	local section_name=''
+	local mac=''
+	local password=''
+	local secureon=''
+
+	config_get section_name "${section}" 'name' "${section}"
+
+	config_get mac "${section}" 'mac'
+	[ -z "${mac}" ] && {
+		logger -t "${NAME}" "Target '${section_name}' has no 'mac' address"
+		return 1
 	}
 
-	# secureOn password
-	config_get value "${section}" 'secureon'
-	[ -n "${value}" ] && append args "-p ${value}"
+	# password (legacy option)
+	config_get password "${section}" 'password'
+	[ -n "${password}" ] && {
+		password=$(etherwake_password "${password}")
+	}
 
-	# name
-	config_get section_name "${section}" 'name'
-	[ -z "${section_name}" ] && section_name="${section}"
+	config_get secureon "${section}" 'secureon'
 
-	# mac address
-	config_get value "${section}" 'mac'
-	[ -z "${value}" ] && {
-		echo "Target '${section_name}' has no 'mac' address"; return 1; }
-	append args "${value}"
+	set --
+	[ -n "${iface}" ] && set -- "$@" -i "${iface}"
+	[ "${broadcast}" = "1" ] && set -- "$@" -b
+	[ -n "${password}" ] && set -- "$@" -p "${password}"
+	[ -n "${secureon}" ] && set -- "$@" -p "${secureon}"
+	set -- "$@" "${mac}"
 
-	# execute command
-	echo "Waking up '${section_name}' via ${PROGRAM}${args:+ ${args}}"
-	${PROGRAM} ${args}
+	logger -t "${NAME}" "Waking up '${section_name}' via ${PROGRAM} $*"
+
+	"${PROGRAM}" "$@"
+
 	return $?
 }
 
-
-# prepare hex password (support legacy option)
-etherwake_password()
-{
+# make string look like ethernet hex format (support legacy password option)
+etherwake_password() {
 	local delimiter=':'
-	local password=`echo "$1" | sed "s/../&${delimiter}/g"`
+	local password=$(echo "$1" | sed "s/../&${delimiter}/g")
 	echo "${password%${delimiter}}"
-	return
 }
